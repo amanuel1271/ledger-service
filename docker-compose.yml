@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql://ledger:ledger@postgres:5432/ledger
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: ledger, POSTGRES_PASSWORD: ledger, POSTGRES_DB: ledger }
+    ports: ["55432:5432"]
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "ledger"], interval: 2s, retries: 15 }
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
