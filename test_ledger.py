@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 import time
 
-from app import app, relay_once
+from app import OutboxRelay, app
 
 
 @pytest.fixture(scope="module")
@@ -89,19 +89,19 @@ class RedisDown:
 
 
 def test_events_survive_a_redis_outage(client):
-    app.state.relay_paused = True
+    app.state.relay.pause()
     try:
         a, b = account(client, 100), account(client, 0)
         before = outbox_count(client)
         assert transfer(client, a, b, 10).status_code == 201
         assert outbox_count(client) == before + 2  # one event per account, committed with the transfer
         try:
-            client.portal.call(relay_once, app.state.db, RedisDown())
+            client.portal.call(OutboxRelay(app.state.db, RedisDown()).run_once)
         except ConnectionError:
             pass
         assert outbox_count(client) == before + 2  # publish failed -> nothing deleted
     finally:
-        app.state.relay_paused = False
+        app.state.relay.resume()
     deadline = time.time() + 3
     while outbox_count(client) and time.time() < deadline:  # relay recovers on its own
         time.sleep(0.05)
@@ -109,11 +109,11 @@ def test_events_survive_a_redis_outage(client):
 
 
 def test_rejected_transfer_writes_no_events(client):
-    app.state.relay_paused = True
+    app.state.relay.pause()
     try:
         a, b = account(client, 5), account(client, 0)
         before = outbox_count(client)
         assert transfer(client, a, b, 6).status_code == 422
         assert outbox_count(client) == before
     finally:
-        app.state.relay_paused = False
+        app.state.relay.resume()

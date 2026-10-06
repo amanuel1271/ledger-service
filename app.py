@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -12,35 +13,55 @@ from pydantic import BaseModel, Field
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ledger:ledger@localhost:55432/ledger")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:56379")
-RELAY_BATCH = 100
 log = logging.getLogger("ledger")
 
 
-async def relay_once(db, redis_client) -> int:
-    """Publish one batch of outbox events, then delete them. If publishing fails the
-    transaction rolls back and the events stay for the next try (at-least-once delivery)."""
-    async with db.acquire() as conn, conn.transaction():
-        rows = await conn.fetch(
-            "SELECT id, channel, payload FROM outbox ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED", RELAY_BATCH
-        )
-        for row in rows:  # event_id lets consumers drop the rare duplicate after a crash mid-batch
-            await redis_client.publish(row["channel"], json.dumps({**json.loads(row["payload"]), "event_id": row["id"]}))
-        if rows:
-            await conn.execute("DELETE FROM outbox WHERE id = ANY($1::bigint[])", [r["id"] for r in rows])
-    return len(rows)
+class OutboxRelay:
+    """Moves events from the outbox table to Redis. Owns its background task, so start/stop/pause live in one place."""
 
+    def __init__(self, db, redis_client, batch: int = 100, idle_s: float = 0.1):
+        self.db, self.redis, self.batch, self.idle_s = db, redis_client, batch, idle_s
+        self.paused = False
+        self._task = None
 
-async def relay_loop(app: FastAPI):
-    # ponytail: one poller per process, 100 ms idle latency. Switch to LISTEN/NOTIFY if that's too slow.
-    while True:
-        sent = 0
-        if not app.state.relay_paused:
-            try:
-                sent = await relay_once(app.state.db, app.state.redis)
-            except Exception:
-                log.exception("[Outbox] RELAY_FAIL retry_in=1s")
-                await asyncio.sleep(1)
-        await asyncio.sleep(0 if sent == RELAY_BATCH else 0.1)
+    def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task  # let an in-flight batch roll back cleanly before the pool closes
+
+    def pause(self):  # tests pause it to inspect the outbox
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    async def run_once(self) -> int:
+        """Publish one batch, then delete it. If publishing fails the transaction rolls back
+        and the events stay for the next try (at-least-once delivery)."""
+        async with self.db.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id, channel, payload FROM outbox ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED", self.batch
+            )
+            for row in rows:  # event_id lets consumers drop the rare duplicate after a crash mid-batch
+                await self.redis.publish(row["channel"], json.dumps({**json.loads(row["payload"]), "event_id": row["id"]}))
+            if rows:
+                await conn.execute("DELETE FROM outbox WHERE id = ANY($1::bigint[])", [r["id"] for r in rows])
+        return len(rows)
+
+    async def _run(self):
+        # ponytail: one poller per process, 100 ms idle latency. Switch to LISTEN/NOTIFY if that's too slow.
+        while True:
+            sent = 0
+            if not self.paused:
+                try:
+                    sent = await self.run_once()
+                except Exception:
+                    log.exception("[Outbox] RELAY_FAIL retry_in=1s")
+                    await asyncio.sleep(1)
+            await asyncio.sleep(0 if sent == self.batch else self.idle_s)
 
 
 @asynccontextmanager
@@ -48,10 +69,10 @@ async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL)
     app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
     await app.state.db.execute((Path(__file__).parent / "schema.sql").read_text())
-    app.state.relay_paused = False  # tests pause it to inspect the outbox
-    relay = asyncio.create_task(relay_loop(app))
+    app.state.relay = OutboxRelay(app.state.db, app.state.redis)
+    app.state.relay.start()
     yield
-    relay.cancel()
+    await app.state.relay.stop()
     await app.state.db.close()
     await app.state.redis.aclose()
 
