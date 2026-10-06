@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +12,35 @@ from pydantic import BaseModel, Field
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ledger:ledger@localhost:55432/ledger")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:56379")
+RELAY_BATCH = 100
+log = logging.getLogger("ledger")
+
+
+async def relay_once(db, redis_client) -> int:
+    """Publish one batch of outbox events, then delete them. If publishing fails the
+    transaction rolls back and the events stay for the next try (at-least-once delivery)."""
+    async with db.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(
+            "SELECT id, channel, payload FROM outbox ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED", RELAY_BATCH
+        )
+        for row in rows:  # event_id lets consumers drop the rare duplicate after a crash mid-batch
+            await redis_client.publish(row["channel"], json.dumps({**json.loads(row["payload"]), "event_id": row["id"]}))
+        if rows:
+            await conn.execute("DELETE FROM outbox WHERE id = ANY($1::bigint[])", [r["id"] for r in rows])
+    return len(rows)
+
+
+async def relay_loop(app: FastAPI):
+    # ponytail: one poller per process, 100 ms idle latency. Switch to LISTEN/NOTIFY if that's too slow.
+    while True:
+        sent = 0
+        if not app.state.relay_paused:
+            try:
+                sent = await relay_once(app.state.db, app.state.redis)
+            except Exception:
+                log.exception("[Outbox] RELAY_FAIL retry_in=1s")
+                await asyncio.sleep(1)
+        await asyncio.sleep(0 if sent == RELAY_BATCH else 0.1)
 
 
 @asynccontextmanager
@@ -17,7 +48,10 @@ async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL)
     app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
     await app.state.db.execute((Path(__file__).parent / "schema.sql").read_text())
+    app.state.relay_paused = False  # tests pause it to inspect the outbox
+    relay = asyncio.create_task(relay_loop(app))
     yield
+    relay.cancel()
     await app.state.db.close()
     await app.state.redis.aclose()
 
@@ -75,16 +109,16 @@ async def create_transfer(body: NewTransfer, idempotency_key: str = Header(min_l
                 await conn.execute(
                     "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, account_id
                 )
+            # Same transaction: if the transfer commits, its events exist; if it rolls back, they don't.
+            event = json.dumps({"type": "transfer", **dict(transfer), "created_at": transfer["created_at"].isoformat()})
+            await conn.executemany(
+                "INSERT INTO outbox (channel, payload) VALUES ($1, $2::jsonb)",
+                [(f"account:{account_id}", event) for account_id in (body.from_id, body.to_id)],
+            )
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(404, "account not found")
     except asyncpg.CheckViolationError:
         raise HTTPException(422, "insufficient funds")
-
-    event = json.dumps({"type": "transfer", **dict(transfer), "created_at": transfer["created_at"].isoformat()})
-    # ponytail: published after commit, so a crash right here drops the live event
-    # (the ledger itself is safe). Use a transactional outbox if events must be durable.
-    for account_id in (body.from_id, body.to_id):
-        await app.state.redis.publish(f"account:{account_id}", event)
     return dict(transfer)
 
 

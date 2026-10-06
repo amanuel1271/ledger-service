@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
-from app import app
+import time
+
+from app import app, relay_once
 
 
 @pytest.fixture(scope="module")
@@ -74,3 +76,44 @@ def test_websocket_streams_transfer_events(client):
         transfer(client, a, b, 40)
         event = ws.receive_json()
     assert (event["type"], event["to_id"], event["amount"]) == ("transfer", b, 40)
+    assert isinstance(event["event_id"], int)  # lets consumers drop a rare duplicate
+
+
+def outbox_count(client):
+    return client.portal.call(app.state.db.fetchval, "SELECT count(*) FROM outbox")
+
+
+class RedisDown:
+    async def publish(self, *args):
+        raise ConnectionError("redis is down")
+
+
+def test_events_survive_a_redis_outage(client):
+    app.state.relay_paused = True
+    try:
+        a, b = account(client, 100), account(client, 0)
+        before = outbox_count(client)
+        assert transfer(client, a, b, 10).status_code == 201
+        assert outbox_count(client) == before + 2  # one event per account, committed with the transfer
+        try:
+            client.portal.call(relay_once, app.state.db, RedisDown())
+        except ConnectionError:
+            pass
+        assert outbox_count(client) == before + 2  # publish failed -> nothing deleted
+    finally:
+        app.state.relay_paused = False
+    deadline = time.time() + 3
+    while outbox_count(client) and time.time() < deadline:  # relay recovers on its own
+        time.sleep(0.05)
+    assert outbox_count(client) == 0
+
+
+def test_rejected_transfer_writes_no_events(client):
+    app.state.relay_paused = True
+    try:
+        a, b = account(client, 5), account(client, 0)
+        before = outbox_count(client)
+        assert transfer(client, a, b, 6).status_code == 422
+        assert outbox_count(client) == before
+    finally:
+        app.state.relay_paused = False

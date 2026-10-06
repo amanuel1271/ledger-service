@@ -14,3 +14,12 @@ CREATE TABLE IF NOT EXISTS transfers (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (from_id <> to_id)
 );
+
+-- Transactional outbox: events are written in the same transaction as the transfer,
+-- so a committed transfer always has its events. The relay publishes them to Redis, then deletes them.
+CREATE TABLE IF NOT EXISTS outbox (
+    id         BIGSERIAL PRIMARY KEY,
+    channel    TEXT  NOT NULL,
+    payload    JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
