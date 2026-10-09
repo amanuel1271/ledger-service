@@ -23,3 +23,24 @@ CREATE TABLE IF NOT EXISTS outbox (
     payload    JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Deposits (+) and withdrawals (-). Idempotent like transfers.
+CREATE TABLE IF NOT EXISTS cash_movements (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key TEXT   NOT NULL UNIQUE,
+    account_id      BIGINT NOT NULL REFERENCES accounts,
+    amount          BIGINT NOT NULL CHECK (amount <> 0),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The ledger: one row per balance change, written in the same transaction as the change.
+-- Invariant (tested): accounts.balance = SUM(entries.amount) for every account.
+CREATE TABLE IF NOT EXISTS entries (
+    id         BIGSERIAL PRIMARY KEY,
+    account_id BIGINT NOT NULL REFERENCES accounts,
+    amount     BIGINT NOT NULL CHECK (amount <> 0),
+    kind       TEXT   NOT NULL CHECK (kind IN ('opening', 'deposit', 'withdrawal', 'transfer_in', 'transfer_out')),
+    ref_id     BIGINT,  -- transfers.id or cash_movements.id
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS entries_account_newest ON entries (account_id, id DESC);  -- history pages

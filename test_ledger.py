@@ -117,3 +117,67 @@ def test_rejected_transfer_writes_no_events(client):
         assert outbox_count(client) == before
     finally:
         app.state.relay.resume()
+
+
+def move(client, account_id, kind, amount, key=None):
+    return client.post(f"/accounts/{account_id}/{kind}", json={"amount": amount},
+                       headers={"Idempotency-Key": key or str(uuid.uuid4())})
+
+
+def ledger_sum(client, account_id):
+    return client.portal.call(app.state.db.fetchval,
+                              "SELECT COALESCE(SUM(amount), 0) FROM entries WHERE account_id = $1", account_id)
+
+
+def test_deposit_and_withdrawal(client):
+    a = account(client, 100)
+    assert move(client, a, "deposits", 50).status_code == 201
+    assert move(client, a, "withdrawals", 30).status_code == 201
+    assert balance(client, a) == 120
+
+
+def test_withdrawal_cannot_overdraw(client):
+    a = account(client, 10)
+    assert move(client, a, "withdrawals", 11).status_code == 422
+    assert balance(client, a) == 10 and ledger_sum(client, a) == 10
+
+
+def test_deposit_is_idempotent(client):
+    a = account(client, 0)
+    key = str(uuid.uuid4())
+    first, retry = move(client, a, "deposits", 25, key), move(client, a, "deposits", 25, key)
+    assert retry.json()["id"] == first.json()["id"] and balance(client, a) == 25
+    assert move(client, a, "deposits", 99, key).status_code == 409  # same key, different amount
+    assert move(client, a, "withdrawals", 25, key).status_code == 409  # same key, different direction
+
+
+def test_unknown_account_is_404(client):
+    assert move(client, 10**12, "deposits", 5).status_code == 404
+    assert client.get(f"/accounts/{10**12}/transactions").status_code == 404
+
+
+def test_balance_always_equals_ledger(client):
+    a, b = account(client, 1000), account(client, 1000)
+    jobs = [(a, b) if i % 2 else (b, a) for i in range(100)]
+    with ThreadPoolExecutor(20) as pool:
+        list(pool.map(lambda pair: transfer(client, *pair, 7), jobs))
+        list(pool.map(lambda i: move(client, a, "deposits" if i % 2 else "withdrawals", 3), range(40)))
+    for acct in (a, b):
+        assert balance(client, acct) == ledger_sum(client, acct)
+
+
+def test_history_pages_cover_everything_newest_first(client):
+    a, b = account(client, 100), account(client, 0)
+    move(client, a, "deposits", 10)
+    transfer(client, a, b, 20)
+    move(client, a, "withdrawals", 5)
+    seen, cursor = [], None
+    while True:
+        page = client.get(f"/accounts/{a}/transactions", params={"limit": 2, **({"cursor": cursor} if cursor else {})}).json()
+        seen += page["items"]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert [e["kind"] for e in seen] == ["withdrawal", "transfer_out", "deposit", "opening"]
+    assert [e["amount"] for e in seen] == [-5, -20, 10, 100]
+    assert len({e["id"] for e in seen}) == 4  # no duplicates across pages

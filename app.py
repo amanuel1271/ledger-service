@@ -8,7 +8,7 @@ from pathlib import Path
 
 import asyncpg
 import redis.asyncio as redis
-from fastapi import FastAPI, Header, HTTPException, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ledger:ledger@localhost:55432/ledger")
@@ -85,6 +85,10 @@ class NewAccount(BaseModel):
     opening_balance: int = Field(0, ge=0)
 
 
+class CashMovement(BaseModel):
+    amount: int = Field(gt=0)
+
+
 class NewTransfer(BaseModel):
     from_id: int
     to_id: int
@@ -93,11 +97,21 @@ class NewTransfer(BaseModel):
 
 @app.post("/accounts", status_code=201)
 async def create_account(body: NewAccount):
-    row = await app.state.db.fetchrow(
-        "INSERT INTO accounts (owner, balance) VALUES ($1, $2) RETURNING *",
-        body.owner, body.opening_balance,
-    )
+    async with app.state.db.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "INSERT INTO accounts (owner, balance) VALUES ($1, $2) RETURNING *",
+            body.owner, body.opening_balance,
+        )
+        if body.opening_balance:
+            await add_entry(conn, row["id"], body.opening_balance, "opening", None)
     return dict(row)
+
+
+async def add_entry(conn, account_id: int, amount: int, kind: str, ref_id: int | None):
+    await conn.execute(
+        "INSERT INTO entries (account_id, amount, kind, ref_id) VALUES ($1, $2, $3, $4)",
+        account_id, amount, kind, ref_id,
+    )
 
 
 @app.get("/accounts/{account_id}")
@@ -130,6 +144,8 @@ async def create_transfer(body: NewTransfer, idempotency_key: str = Header(min_l
                 await conn.execute(
                     "UPDATE accounts SET balance = balance + $1 WHERE id = $2", delta, account_id
                 )
+            await add_entry(conn, body.from_id, -body.amount, "transfer_out", transfer["id"])
+            await add_entry(conn, body.to_id, body.amount, "transfer_in", transfer["id"])
             # Same transaction: if the transfer commits, its events exist; if it rolls back, they don't.
             event = json.dumps({"type": "transfer", **dict(transfer), "created_at": transfer["created_at"].isoformat()})
             await conn.executemany(
@@ -148,6 +164,58 @@ async def replay(conn, idempotency_key: str, body: NewTransfer):
     if (existing["from_id"], existing["to_id"], existing["amount"]) != (body.from_id, body.to_id, body.amount):
         raise HTTPException(409, "idempotency key reused with a different request")
     return dict(existing)
+
+
+@app.post("/accounts/{account_id}/deposits", status_code=201)
+async def deposit(account_id: int, body: CashMovement, idempotency_key: str = Header(min_length=1)):
+    return await move_cash(account_id, body.amount, "deposit", idempotency_key)
+
+
+@app.post("/accounts/{account_id}/withdrawals", status_code=201)
+async def withdraw(account_id: int, body: CashMovement, idempotency_key: str = Header(min_length=1)):
+    return await move_cash(account_id, -body.amount, "withdrawal", idempotency_key)
+
+
+async def move_cash(account_id: int, amount: int, kind: str, idempotency_key: str):
+    """Deposit (amount > 0) or withdrawal (amount < 0). Same guarantees as transfers:
+    idempotent, overdraft-proof via the CHECK, and ledger entry + event in the same transaction."""
+    try:
+        async with app.state.db.acquire() as conn, conn.transaction():
+            movement = await conn.fetchrow(
+                """INSERT INTO cash_movements (idempotency_key, account_id, amount) VALUES ($1, $2, $3)
+                   ON CONFLICT (idempotency_key) DO NOTHING RETURNING *""",
+                idempotency_key, account_id, amount,
+            )
+            if movement is None:  # retry of an earlier request
+                existing = await conn.fetchrow("SELECT * FROM cash_movements WHERE idempotency_key = $1", idempotency_key)
+                if (existing["account_id"], existing["amount"]) != (account_id, amount):
+                    raise HTTPException(409, "idempotency key reused with a different request")
+                return dict(existing)
+            await conn.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", amount, account_id)
+            await add_entry(conn, account_id, amount, kind, movement["id"])
+            event = json.dumps({"type": kind, **dict(movement), "created_at": movement["created_at"].isoformat()})
+            await conn.execute("INSERT INTO outbox (channel, payload) VALUES ($1, $2::jsonb)", f"account:{account_id}", event)
+    except asyncpg.ForeignKeyViolationError:
+        raise HTTPException(404, "account not found")
+    except asyncpg.CheckViolationError:
+        raise HTTPException(422, "insufficient funds")
+    return dict(movement)
+
+
+@app.get("/accounts/{account_id}/transactions")
+async def transactions(account_id: int, limit: int = Query(50, ge=1, le=100), cursor: int | None = None):
+    """Newest first. Keyset pagination: pass next_cursor back to get the following page.
+    Unlike OFFSET, pages don't shift or repeat while new entries are being written."""
+    if not await app.state.db.fetchval("SELECT 1 FROM accounts WHERE id = $1", account_id):
+        raise HTTPException(404, "account not found")
+    rows = await app.state.db.fetch(
+        """SELECT id, amount, kind, ref_id, created_at FROM entries
+           WHERE account_id = $1 AND ($2::bigint IS NULL OR id < $2)
+           ORDER BY id DESC LIMIT $3""",
+        account_id, cursor, limit + 1,  # one extra row tells us whether another page exists
+    )
+    page = [dict(r) for r in rows[:limit]]
+    return {"items": page, "next_cursor": page[-1]["id"] if len(rows) > limit else None}
 
 
 @app.websocket("/ws/accounts/{account_id}")
