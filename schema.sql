@@ -44,3 +44,15 @@ CREATE TABLE IF NOT EXISTS entries (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS entries_account_newest ON entries (account_id, id DESC);  -- history pages
+
+-- Account age is a risk signal. ALTER (not the CREATE above) so existing databases get it too.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- Cache of model verdicts, so a transfer is sent to the model once. Rules verdicts are not
+-- cached: they are instant, and the model gets another chance next time.
+CREATE TABLE IF NOT EXISTS risk_reviews (
+    transfer_id BIGINT PRIMARY KEY REFERENCES transfers,
+    risk        TEXT NOT NULL CHECK (risk IN ('low', 'medium', 'high')),
+    reason      TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

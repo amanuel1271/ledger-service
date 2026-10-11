@@ -5,6 +5,7 @@ services:
     environment:
       DATABASE_URL: postgresql://ledger:ledger@postgres:5432/ledger
       REDIS_URL: redis://redis:6379
+      OLLAMA_URL: http://host.docker.internal:11434  # optional: Ollama on the host for AI risk reviews
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_started }

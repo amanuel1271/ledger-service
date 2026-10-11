@@ -5,6 +5,7 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
+![Local LLM](https://img.shields.io/badge/LLM-Qwen%20via%20Ollama-6E56CF)
 
 A small payments ledger API. Accounts hold balances; deposits, withdrawals and transfers move money; every change is recorded in a ledger you can page through; and clients can watch an account live over a WebSocket.
 
@@ -61,6 +62,37 @@ The database does the safety work, not application code:
 | A committed transfer always gets its events | Events go into an `outbox` table in the **same transaction** as the transfer. A rolled-back transfer leaves no events. |
 | Events survive a Redis outage | The relay deletes events only after publishing them. If publishing fails, the transaction rolls back and the events are retried. |
 
+## AI risk review
+
+`GET /transfers/{id}/risk` gives a second opinion on a transfer. It is **advisory only**: it never blocks, delays or changes a payment, because a language model must not decide whether money moves.
+
+```mermaid
+flowchart LR
+    T[Transfer] --> F[Facts from the database]
+    F --> Q{Qwen 2.5 via Ollama}
+    Q -->|valid JSON verdict| C[(cache)] --> R[risk + reason + facts]
+    Q -.down / slower than 8 s / invalid output.-> RU[Fixed rules script] --> R
+```
+
+1. **Facts come from SQL, not from the model:** the amount, the sender's account age, transfers in the previous 10 minutes, the sender's usual amount, whether the recipient is new, and the share of the balance moved. All are measured as of the transfer, so the answer doesn't drift.
+2. **A local Qwen model** judges the facts. It runs on your machine through [Ollama](https://ollama.com): no API key, and no data leaves the host.
+3. **If the model is unavailable, slow, or returns anything invalid**, a fixed rules script scores the same facts. The response says which one answered (`"engine": "qwen"` or `"rules"`).
+4. Model verdicts are cached per transfer. Rules verdicts are not, so the model gets another chance next time.
+
+```json
+{
+  "risk": "high",
+  "reason": "amount is 593x the sender's usual; 6 transfers in the previous 10 minutes; moves 100% of the balance; sender account is under an hour old",
+  "engine": "rules",
+  "facts": {"amount": 99000, "sender_account_age_s": 0, "sender_transfers_last_10m": 6,
+            "sender_avg_amount": 167, "first_time_recipient": false, "share_of_balance": 1.0}
+}
+```
+
+The response always includes the `facts`, so a person can check the model's reasoning against them. A small model can get the level right and still describe it loosely.
+
+To turn the model on: `ollama pull qwen2.5:3b`. Without it, everything works on the rules path (that is what CI runs).
+
 ## API
 
 | Method | Path | Description |
@@ -70,6 +102,7 @@ The database does the safety work, not application code:
 | `POST` | `/transfers` | Move money: `{"from_id": 1, "to_id": 2, "amount": 2500}` with header `Idempotency-Key` |
 | `POST` | `/accounts/{id}/deposits` | Add money: `{"amount": 5000}` with header `Idempotency-Key` |
 | `POST` | `/accounts/{id}/withdrawals` | Take money out: `{"amount": 1000}` with header `Idempotency-Key`. Fails with `422` rather than overdraw. |
+| `GET` | `/transfers/{id}/risk` | Advisory fraud-risk review: `{risk, reason, engine, facts}`. Never blocks a transfer. |
 | `GET` | `/accounts/{id}/transactions?limit=50&cursor=` | Ledger history, newest first. Pass `next_cursor` back to get the next page. |
 | `WS` | `/ws/accounts/{id}` | Stream transfer events for an account |
 
@@ -104,12 +137,13 @@ docker compose up -d postgres redis
 docker compose run --rm api pytest -q
 ```
 
-They cover a normal transfer, idempotent retries, a reused key with a different body, overdraft rejection, 200 concurrent transfers in both directions (money conserved, no deadlock), live WebSocket events, events surviving a Redis outage (the relay recovers on its own), a rejected transfer leaving no events, deposits and withdrawals (idempotent, overdraft-proof), balance always equal to the ledger after concurrent operations, and history pages covering every entry exactly once.
+They cover a normal transfer, idempotent retries, a reused key with a different body, overdraft rejection, 200 concurrent transfers in both directions (money conserved, no deadlock), live WebSocket events, events surviving a Redis outage (the relay recovers on its own), a rejected transfer leaving no events, deposits and withdrawals (idempotent, overdraft-proof), balance always equal to the ledger after concurrent operations, history pages covering every entry exactly once, and the risk review (rule thresholds, model verdict used and cached, invalid model output rejected, money never touched).
 
 ## Trade-offs
 
 - Events are delivered **at least once**. If the relay crashes after publishing but before deleting, a few events can be sent again. Each event has an `event_id`, so clients can drop duplicates.
 - The relay checks the outbox every 100 ms, so live events can lag a transfer by up to about 0.1 s. Postgres `LISTEN/NOTIFY` would cut that if it ever matters.
 - With several app instances, each runs a relay. `SKIP LOCKED` stops them from sending the same event twice, but events for one account can then arrive out of order. Order by `event_id` if that matters.
+- The risk review is a second opinion, not a fraud system: six simple facts and a small local model. Its value here is the pattern (model with a deterministic fallback, validated output, never in the payment path).
 - History uses **keyset (cursor) pagination** (`WHERE id < cursor ORDER BY id DESC`) instead of `OFFSET`. Pages stay stable while new entries arrive, and deep pages are as fast as the first.
 - Idempotency keys are unique per operation type: transfers and deposits/withdrawals keep their keys in separate tables.

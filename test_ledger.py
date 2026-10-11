@@ -6,7 +6,10 @@ from fastapi.testclient import TestClient
 
 import time
 
-from app import OutboxRelay, app
+import json
+
+from app import OutboxRelay, app, transfer_facts
+from risk import QwenRiskReviewer, rules_risk
 
 
 @pytest.fixture(scope="module")
@@ -181,3 +184,83 @@ def test_history_pages_cover_everything_newest_first(client):
     assert [e["kind"] for e in seen] == ["withdrawal", "transfer_out", "deposit", "opening"]
     assert [e["amount"] for e in seen] == [-5, -20, 10, 100]
     assert len({e["id"] for e in seen}) == 4  # no duplicates across pages
+
+
+class FakeReviewer:
+    """Stands in for the model: returns a fixed verdict, or None to simulate "model unavailable"."""
+
+    def __init__(self, verdict=None):
+        self.verdict = verdict
+
+    async def review(self, facts):
+        return self.verdict
+
+    async def close(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def model_unavailable(client):
+    app.state.risk = FakeReviewer(None)  # every test starts on the rules path, like CI
+
+
+def risk(client, transfer_id):
+    return client.get(f"/transfers/{transfer_id}/risk")
+
+
+def test_ordinary_transfer_is_low_risk(client):
+    a, b = account(client, 10_000), account(client, 0)
+    t = transfer(client, a, b, 100).json()
+    r = risk(client, t["id"]).json()
+    assert (r["risk"], r["engine"]) == ("low", "rules")
+    assert r["facts"]["first_time_recipient"] is True and r["facts"]["share_of_balance"] == 0.01
+    # the real model client json.dumps() the facts; a Decimal here once crashed it while stubs passed
+    json.dumps(client.portal.call(transfer_facts, app.state.db, t["id"]))
+
+
+def test_burst_then_draining_transfer_is_high_risk(client):
+    a, b = account(client, 10_000), account(client, 0)
+    for _ in range(5):
+        transfer(client, a, b, 10)
+    t = transfer(client, a, b, 9_950).json()  # 995x the usual amount, empties the account
+    r = risk(client, t["id"]).json()
+    assert (r["risk"], r["engine"]) == ("high", "rules")
+    assert "the sender's usual" in r["reason"] and "5 transfers in the previous 10 minutes" in r["reason"]
+    assert r["facts"]["share_of_balance"] == 1.0
+
+
+def test_risk_review_never_changes_money(client):
+    a, b = account(client, 500), account(client, 0)
+    t = transfer(client, a, b, 500).json()
+    risk(client, t["id"])
+    assert (balance(client, a), balance(client, b)) == (0, 500)
+
+
+def test_unknown_transfer_risk_is_404(client):
+    assert risk(client, 10**12).status_code == 404
+
+
+def test_model_verdict_is_used_and_cached(client):
+    a, b = account(client, 1000), account(client, 0)
+    t = transfer(client, a, b, 5).json()
+    app.state.risk = FakeReviewer({"risk": "high", "reason": "model says so", "engine": "qwen"})
+    assert risk(client, t["id"]).json()["engine"] == "qwen"
+    app.state.risk = FakeReviewer(None)  # model goes down: the cached verdict still answers
+    r = risk(client, t["id"]).json()
+    assert (r["risk"], r["reason"], r["engine"]) == ("high", "model says so", "qwen")
+
+
+def test_invalid_model_output_is_rejected():
+    parse = QwenRiskReviewer.parse
+    assert parse('{"risk": "high", "reason": "many transfers"}') == {"risk": "high", "reason": "many transfers", "engine": "qwen"}
+    for bad in ['not json', '{"risk": "banana", "reason": "x"}', '{"risk": "high"}', '{"risk": "low", "reason": ""}', '["high"]']:
+        assert parse(bad) is None, bad
+
+
+def test_rules_thresholds():
+    base = {"amount": 100, "sender_account_age_s": 10**6, "sender_transfers_last_10m": 0,
+            "sender_avg_amount": 100, "first_time_recipient": False, "share_of_balance": 0.1}
+    assert rules_risk(base) == {"risk": "low", "reason": "no risk signals", "engine": "rules"}
+    assert rules_risk({**base, "sender_transfers_last_10m": 5, "first_time_recipient": True})["risk"] == "medium"  # 2+1
+    assert rules_risk({**base, "sender_transfers_last_10m": 5, "amount": 1000})["risk"] == "high"  # 2+2
+    assert rules_risk({**base, "sender_avg_amount": None, "amount": 10**9})["risk"] == "low"  # no history: no "usual"

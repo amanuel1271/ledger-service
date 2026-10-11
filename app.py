@@ -11,8 +11,11 @@ import redis.asyncio as redis
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket
 from pydantic import BaseModel, Field
 
+from risk import QwenRiskReviewer, rules_risk
+
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ledger:ledger@localhost:55432/ledger")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:56379")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 log = logging.getLogger("ledger")
 
 
@@ -71,7 +74,9 @@ async def lifespan(app: FastAPI):
     await app.state.db.execute((Path(__file__).parent / "schema.sql").read_text())
     app.state.relay = OutboxRelay(app.state.db, app.state.redis)
     app.state.relay.start()
+    app.state.risk = QwenRiskReviewer(OLLAMA_URL)
     yield
+    await app.state.risk.close()
     await app.state.relay.stop()
     await app.state.db.close()
     await app.state.redis.aclose()
@@ -164,6 +169,52 @@ async def replay(conn, idempotency_key: str, body: NewTransfer):
     if (existing["from_id"], existing["to_id"], existing["amount"]) != (body.from_id, body.to_id, body.amount):
         raise HTTPException(409, "idempotency key reused with a different request")
     return dict(existing)
+
+
+async def transfer_facts(db, transfer_id: int) -> dict | None:
+    """What the reviewer sees. Everything is measured as of the transfer itself, so the answer doesn't drift."""
+    row = await db.fetchrow(
+        """SELECT t.amount,
+                  EXTRACT(EPOCH FROM t.created_at - a.created_at) AS sender_account_age_s,
+                  (SELECT count(*) FROM transfers p WHERE p.from_id = t.from_id AND p.id < t.id
+                      AND p.created_at > t.created_at - interval '10 minutes') AS sender_transfers_last_10m,
+                  (SELECT avg(p.amount) FROM transfers p WHERE p.from_id = t.from_id AND p.id < t.id) AS sender_avg_amount,
+                  NOT EXISTS (SELECT 1 FROM transfers p WHERE p.from_id = t.from_id AND p.to_id = t.to_id
+                      AND p.id < t.id) AS first_time_recipient,
+                  (SELECT COALESCE(SUM(e.amount), 0) FROM entries e WHERE e.account_id = t.from_id AND e.id <
+                      (SELECT id FROM entries WHERE ref_id = t.id AND kind = 'transfer_out')) AS balance_before
+           FROM transfers t JOIN accounts a ON a.id = t.from_id WHERE t.id = $1""",
+        transfer_id,
+    )
+    if row is None:
+        return None
+    return {
+        "amount": row["amount"],
+        "sender_account_age_s": round(float(row["sender_account_age_s"])),
+        "sender_transfers_last_10m": row["sender_transfers_last_10m"],
+        "sender_avg_amount": round(float(row["sender_avg_amount"])) if row["sender_avg_amount"] else None,
+        "first_time_recipient": row["first_time_recipient"],
+        # SUM() comes back as Decimal; the facts must be plain JSON types for the model request
+        "share_of_balance": round(row["amount"] / int(row["balance_before"]), 2) if row["balance_before"] > 0 else 1.0,
+    }
+
+
+@app.get("/transfers/{transfer_id}/risk")
+async def transfer_risk(transfer_id: int):
+    """Advisory only: this never blocks or changes a transfer."""
+    facts = await transfer_facts(app.state.db, transfer_id)
+    if facts is None:
+        raise HTTPException(404, "transfer not found")
+    cached = await app.state.db.fetchrow("SELECT risk, reason FROM risk_reviews WHERE transfer_id = $1", transfer_id)
+    if cached:
+        return {**dict(cached), "engine": "qwen", "facts": facts}
+    verdict = await app.state.risk.review(facts)
+    if verdict:
+        await app.state.db.execute(
+            "INSERT INTO risk_reviews (transfer_id, risk, reason) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            transfer_id, verdict["risk"], verdict["reason"],
+        )
+    return {**(verdict or rules_risk(facts)), "facts": facts}
 
 
 @app.post("/accounts/{account_id}/deposits", status_code=201)
