@@ -18,3 +18,9 @@ jobs:
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r requirements.txt
       - run: pytest -q
+      - name: Load test (money conserved, no errors)
+        run: |
+          uvicorn app:app --port 8000 &
+          timeout 30 sh -c 'until curl -s localhost:8000/docs > /dev/null; do sleep 1; done'
+          python loadtest.py --requests 500 --concurrency 10
+          python loadtest.py --requests 500 --concurrency 10 --hot

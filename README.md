@@ -128,6 +128,29 @@ curl -X POST localhost:8000/transfers -H 'Content-Type: application/json' \
      -H 'Idempotency-Key: order-42' -d '{"from_id":1,"to_id":2,"amount":2500}'
 ```
 
+## Performance
+
+`loadtest.py` fires concurrent transfers at a running service, then checks that the total money across all accounts is unchanged and every request returned `201`. It exits non-zero otherwise, and CI runs a small version on every push.
+
+```bash
+docker compose up -d --build
+python loadtest.py --requests 10000 --concurrency 10          # spread over 100 accounts
+python loadtest.py --requests 10000 --concurrency 10 --hot    # every transfer debits the same account
+```
+
+Results on a laptop (Docker Desktop, 4 CPUs shared by Postgres, the API and the load generator; one uvicorn worker; 10,000 transfers per run):
+
+| Scenario | Concurrency | Throughput | p50 | p95 | p99 | Errors | Money conserved |
+|---|---|---|---|---|---|---|---|
+| Spread over 100 accounts | 10 | 1,372 transfers/s | 5.1 ms | 19.7 ms | 35.7 ms | 0 | yes |
+| Hot account (all debit #1) | 10 | 1,181 transfers/s | 6.2 ms | 22.2 ms | 33.4 ms | 0 | yes |
+
+What the test showed:
+
+- **Pool size was the first limit.** With the default 10 database connections, 50 concurrent clients queued for a connection and throughput fell to about 460/s. The pool is now 20 by default (`DB_POOL_SIZE`). Higher values didn't help further.
+- **A hot account costs about 14%, not more.** Every transfer row-locks account #1, but each transaction holds the lock for only a few milliseconds, so they line up quickly.
+- **At 50+ concurrent requests the load generator is the limit, not the service.** A single Python client process uses about 90% of a core and results become noisy (roughly 500 to 870/s). To push harder, run several `loadtest.py` processes or a dedicated tool. A single uvicorn worker is also a ceiling; more workers behind the same Postgres is the next step.
+
 ## Tests
 
 The tests run against real PostgreSQL and Redis, the same way CI does:

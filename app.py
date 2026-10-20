@@ -69,7 +69,7 @@ class OutboxRelay:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = await asyncpg.create_pool(DATABASE_URL)
+    app.state.db = await asyncpg.create_pool(DATABASE_URL, max_size=int(os.getenv("DB_POOL_SIZE", "20")))
     app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
     await app.state.db.execute((Path(__file__).parent / "schema.sql").read_text())
     app.state.relay = OutboxRelay(app.state.db, app.state.redis)
