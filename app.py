@@ -3,12 +3,14 @@ import contextlib
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 import redis.asyncio as redis
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
 from risk import QwenRiskReviewer, rules_risk
@@ -17,6 +19,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://ledger:ledger@localhost:5
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:56379")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 log = logging.getLogger("ledger")
+
+# Route templates ("/accounts/{account_id}"), never raw paths, so label count stays bounded.
+REQUESTS = Counter("http_requests_total", "HTTP requests", ["method", "route", "status"])
+LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["method", "route"])
+TRANSFERS = Counter("ledger_transfers_total", "Transfer requests by outcome", ["outcome"])
+OUTBOX_PUBLISHED = Counter("ledger_outbox_published_total", "Events published from the outbox to Redis")
+OUTBOX_BACKLOG = Gauge("ledger_outbox_backlog", "Events waiting in the outbox (measured on scrape)")
 
 
 class OutboxRelay:
@@ -52,7 +61,12 @@ class OutboxRelay:
                 await self.redis.publish(row["channel"], json.dumps({**json.loads(row["payload"]), "event_id": row["id"]}))
             if rows:
                 await conn.execute("DELETE FROM outbox WHERE id = ANY($1::bigint[])", [r["id"] for r in rows])
+        OUTBOX_PUBLISHED.inc(len(rows))  # after commit: rolled-back batches aren't counted
         return len(rows)
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
 
     async def _run(self):
         # ponytail: one poller per process, 100 ms idle latency. Switch to LISTEN/NOTIFY if that's too slow.
@@ -83,6 +97,44 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ledger-service", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def observe(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    path = route.path if route else "unmatched"
+    REQUESTS.labels(request.method, path, response.status_code).inc()
+    LATENCY.labels(request.method, path).observe(time.perf_counter() - start)
+    return response
+
+
+@app.get("/health")
+async def health(response: Response):
+    """Postgres down = 503 (nothing works). Redis down = 200 "degraded": transfers still commit and their
+    events wait safely in the outbox until Redis is back."""
+    checks = {}
+    try:
+        checks["outbox_backlog"] = await asyncio.wait_for(app.state.db.fetchval("SELECT count(*) FROM outbox"), 2)
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"down: {type(e).__name__}"
+    try:
+        await asyncio.wait_for(app.state.redis.ping(), 2)
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"down: {type(e).__name__}"
+    checks["outbox_relay"] = "ok" if app.state.relay.running else "stopped"
+    status = "down" if checks["database"] != "ok" else "ok" if checks["redis"] == checks["outbox_relay"] == "ok" else "degraded"
+    response.status_code = 503 if status == "down" else 200
+    return {"status": status, "checks": checks}
+
+
+@app.get("/metrics")
+async def metrics():
+    OUTBOX_BACKLOG.set(await app.state.db.fetchval("SELECT count(*) FROM outbox"))
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 class NewAccount(BaseModel):
@@ -130,6 +182,7 @@ async def get_account(account_id: int):
 @app.post("/transfers", status_code=201)
 async def create_transfer(body: NewTransfer, idempotency_key: str = Header(min_length=1)):
     if body.from_id == body.to_id:
+        TRANSFERS.labels("invalid").inc()
         raise HTTPException(422, "cannot transfer to the same account")
     try:
         async with app.state.db.acquire() as conn, conn.transaction():
@@ -158,16 +211,21 @@ async def create_transfer(body: NewTransfer, idempotency_key: str = Header(min_l
                 [(f"account:{account_id}", event) for account_id in (body.from_id, body.to_id)],
             )
     except asyncpg.ForeignKeyViolationError:
+        TRANSFERS.labels("not_found").inc()
         raise HTTPException(404, "account not found")
     except asyncpg.CheckViolationError:
+        TRANSFERS.labels("insufficient_funds").inc()
         raise HTTPException(422, "insufficient funds")
+    TRANSFERS.labels("created").inc()
     return dict(transfer)
 
 
 async def replay(conn, idempotency_key: str, body: NewTransfer):
     existing = await conn.fetchrow("SELECT * FROM transfers WHERE idempotency_key = $1", idempotency_key)
     if (existing["from_id"], existing["to_id"], existing["amount"]) != (body.from_id, body.to_id, body.amount):
+        TRANSFERS.labels("conflict").inc()
         raise HTTPException(409, "idempotency key reused with a different request")
+    TRANSFERS.labels("replayed").inc()
     return dict(existing)
 
 

@@ -4,3 +4,4 @@ asyncpg==0.30.*
 redis==5.2.*
 pytest==8.*
 httpx==0.28.*
+prometheus-client==0.21.*

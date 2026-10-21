@@ -105,6 +105,8 @@ To turn the model on: `ollama pull qwen2.5:3b`. Without it, everything works on 
 | `GET` | `/transfers/{id}/risk` | Advisory fraud-risk review: `{risk, reason, engine, facts}`. Never blocks a transfer. |
 | `GET` | `/accounts/{id}/transactions?limit=50&cursor=` | Ledger history, newest first. Pass `next_cursor` back to get the next page. |
 | `WS` | `/ws/accounts/{id}` | Stream transfer events for an account |
+| `GET` | `/health` | Liveness and dependencies: `200 ok`, `200 degraded` (Redis or relay down), `503 down` (Postgres down) |
+| `GET` | `/metrics` | Prometheus metrics (see Observability) |
 
 | Status | Meaning |
 |---|---|
@@ -127,6 +129,32 @@ curl -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"o
 curl -X POST localhost:8000/transfers -H 'Content-Type: application/json' \
      -H 'Idempotency-Key: order-42' -d '{"from_id":1,"to_id":2,"amount":2500}'
 ```
+
+## Observability
+
+`GET /health` checks Postgres, Redis and the outbox relay, and reports the outbox backlog:
+
+```json
+{"status": "ok", "checks": {"database": "ok", "redis": "ok", "outbox_relay": "ok", "outbox_backlog": 0}}
+```
+
+| Status | When | Why |
+|---|---|---|
+| `200 ok` | everything up | |
+| `200 degraded` | Redis or the relay is down | Transfers still commit; their events wait in the outbox and go out when Redis is back, so the service is still useful |
+| `503 down` | Postgres is down | Nothing can be read or written |
+
+`GET /metrics` exposes Prometheus metrics:
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `http_requests_total{method,route,status}` | counter | Traffic and error rate per endpoint |
+| `http_request_duration_seconds{method,route}` | histogram | Latency (p50/p95/p99 via `histogram_quantile`) |
+| `ledger_transfers_total{outcome}` | counter | `created`, `replayed`, `insufficient_funds`, `not_found`, `conflict`, `invalid` |
+| `ledger_outbox_published_total` | counter | Events delivered to Redis |
+| `ledger_outbox_backlog` | gauge | Events waiting; a growing value means Redis or the relay is stuck |
+
+Labels use route templates (`/accounts/{account_id}`), never raw paths, so the number of time series stays bounded.
 
 ## Performance
 
@@ -160,7 +188,7 @@ docker compose up -d postgres redis
 docker compose run --rm api pytest -q
 ```
 
-They cover a normal transfer, idempotent retries, a reused key with a different body, overdraft rejection, 200 concurrent transfers in both directions (money conserved, no deadlock), live WebSocket events, events surviving a Redis outage (the relay recovers on its own), a rejected transfer leaving no events, deposits and withdrawals (idempotent, overdraft-proof), balance always equal to the ledger after concurrent operations, history pages covering every entry exactly once, and the risk review (rule thresholds, model verdict used and cached, invalid model output rejected, money never touched).
+They cover health states (ok / degraded when Redis is down / 503 when Postgres is down), transfer-outcome metrics, bounded metric labels, a normal transfer, idempotent retries, a reused key with a different body, overdraft rejection, 200 concurrent transfers in both directions (money conserved, no deadlock), live WebSocket events, events surviving a Redis outage (the relay recovers on its own), a rejected transfer leaving no events, deposits and withdrawals (idempotent, overdraft-proof), balance always equal to the ledger after concurrent operations, history pages covering every entry exactly once, and the risk review (rule thresholds, model verdict used and cached, invalid model output rejected, money never touched).
 
 ## Trade-offs
 

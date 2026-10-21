@@ -90,6 +90,9 @@ class RedisDown:
     async def publish(self, *args):
         raise ConnectionError("redis is down")
 
+    async def ping(self):
+        raise ConnectionError("redis is down")
+
 
 def test_events_survive_a_redis_outage(client):
     app.state.relay.pause()
@@ -264,3 +267,67 @@ def test_rules_thresholds():
     assert rules_risk({**base, "sender_transfers_last_10m": 5, "first_time_recipient": True})["risk"] == "medium"  # 2+1
     assert rules_risk({**base, "sender_transfers_last_10m": 5, "amount": 1000})["risk"] == "high"  # 2+2
     assert rules_risk({**base, "sender_avg_amount": None, "amount": 10**9})["risk"] == "low"  # no history: no "usual"
+
+
+# ---------- health and metrics ----------
+def metric(client, name, **labels):
+    """Value of one Prometheus sample from /metrics (0 if absent)."""
+    want = ",".join(f'{k}="{v}"' for k, v in labels.items())
+    for line in client.get("/metrics").text.splitlines():
+        if line.startswith(name + ("{" + want + "}" if want else " ")):
+            return float(line.rsplit(" ", 1)[1])
+    return 0.0
+
+
+def test_health_ok(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok" and body["checks"]["database"] == "ok" and body["checks"]["redis"] == "ok"
+    assert body["checks"]["outbox_relay"] == "ok" and isinstance(body["checks"]["outbox_backlog"], int)
+
+
+def test_health_is_degraded_not_down_when_redis_is_down(client):
+    real = app.state.redis
+    app.state.redis = RedisDown()  # the relay keeps its own client; only the health probe sees the outage
+    try:
+        r = client.get("/health")
+    finally:
+        app.state.redis = real
+    assert r.status_code == 200 and r.json()["status"] == "degraded"
+    assert r.json()["checks"]["redis"].startswith("down")
+
+
+def test_health_is_503_when_database_is_down(client):
+    class DbDown:
+        async def fetchval(self, *args):
+            raise ConnectionError("postgres is down")
+    real = app.state.db
+    app.state.db = DbDown()
+    try:
+        r = client.get("/health")
+    finally:
+        app.state.db = real
+    assert r.status_code == 503 and r.json()["status"] == "down"
+
+
+def test_metrics_count_transfer_outcomes(client):
+    before = {o: metric(client, "ledger_transfers_total", outcome=o) for o in ("created", "replayed", "insufficient_funds")}
+    a, b = account(client, 100), account(client, 0)
+    key = "m-" + str(uuid.uuid4())
+    assert transfer(client, a, b, 10, key=key).status_code == 201
+    assert transfer(client, a, b, 10, key=key).status_code == 201  # replay
+    assert transfer(client, a, b, 1000).status_code == 422
+    assert metric(client, "ledger_transfers_total", outcome="created") == before["created"] + 1
+    assert metric(client, "ledger_transfers_total", outcome="replayed") == before["replayed"] + 1
+    assert metric(client, "ledger_transfers_total", outcome="insufficient_funds") == before["insufficient_funds"] + 1
+
+
+def test_metrics_use_route_templates_not_raw_ids(client):
+    a = account(client, 0)
+    client.get(f"/accounts/{a}")
+    text = client.get("/metrics").text
+    assert 'route="/accounts/{account_id}"' in text
+    assert f'route="/accounts/{a}"' not in text  # raw ids would explode label cardinality
+    assert "ledger_outbox_backlog" in text and "http_request_duration_seconds_bucket" in text
+
